@@ -1,0 +1,81 @@
+UCI AIR QUALITY — PREPROCESSING AND EXPLORATION REPORT
+==========================================================
+
+1. Dataset and source inventory
+Loaded 9,357 records and 15 source columns.
+Exact duplicate rows before timestamp cleanup: 0.
+Column counts below separate literal blanks from the dataset's -200 sensor-failure code; effective missing = blanks + -200:
+                 dtype  rows  observed_including_sentinel  blank_missing  sentinel_-200  effective_missing  unique_including_sentinel  effective_observed
+Date               str  9357                         9357              0              0                  0                        391                9357
+Time               str  9357                         9357              0              0                  0                         24                9357
+CO(GT)         float64  9357                         9357              0           1683               1683                         97                7674
+PT08.S1(CO)    float64  9357                         9357              0            366                366                       1042                8991
+NMHC(GT)       float64  9357                         9357              0           8443               8443                        430                 914
+C6H6(GT)       float64  9357                         9357              0            366                366                        408                8991
+PT08.S2(NMHC)  float64  9357                         9357              0            366                366                       1246                8991
+NOx(GT)        float64  9357                         9357              0           1639               1639                        926                7718
+PT08.S3(NOx)   float64  9357                         9357              0            366                366                       1222                8991
+NO2(GT)        float64  9357                         9357              0           1642               1642                        284                7715
+PT08.S4(NO2)   float64  9357                         9357              0            366                366                       1604                8991
+PT08.S5(O3)    float64  9357                         9357              0            366                366                       1744                8991
+T              float64  9357                         9357              0            366                366                        437                8991
+RH             float64  9357                         9357              0            366                366                        754                8991
+AH             float64  9357                         9357              0            366                366                       6684                8991
+
+2. Timestamp checks
+Unparseable timestamps removed: 0.
+Duplicate timestamps removed: 0.
+Valid unique timestamped rows retained: 9,357.
+Observation window: 2004-03-10 18:00:00 through 2005-04-04 14:00:00.
+
+3. Missingness before interpolation
+Sensor-failure codes converted to NaN by source column: CO(GT): 1683; PT08.S1(CO): 366; NMHC(GT): 8443; C6H6(GT): 366; PT08.S2(NMHC): 366; NOx(GT): 1639; PT08.S3(NOx): 366; NO2(GT): 1642; PT08.S4(NO2): 366; PT08.S5(O3): 366; T: 366; RH: 366; AH: 366.
+Out-of-domain values converted to NaN by column: CO(GT): 0; C6H6(GT): 0; NOx(GT): 0; NO2(GT): 0; RH: 0; T: 0.
+Missing numeric cells: 16,701.
+Rows with at least one missing numeric reading: 8,530.
+Rows missing more than one numeric variable: 2,392.
+Longest continuous row run with any missing reading: 8,126.
+Per-column missing counts, percentages, and longest consecutive gaps:
+               missing_count  missing_pct  longest_consecutive_gap
+NMHC(GT)                8443        90.23                     8126
+CO(GT)                  1683        17.99                      173
+NO2(GT)                 1642        17.55                      173
+NOx(GT)                 1639        17.52                      173
+PT08.S1(CO)              366         3.91                       76
+C6H6(GT)                 366         3.91                       76
+PT08.S2(NMHC)            366         3.91                       76
+PT08.S3(NOx)             366         3.91                       76
+PT08.S4(NO2)             366         3.91                       76
+PT08.S5(O3)              366         3.91                       76
+T                        366         3.91                       76
+RH                       366         3.91                       76
+AH                       366         3.91                       76
+NMHC(GT) is the most affected variable: 8,443 of 9,357 records are missing (90.23%). Its longest consecutive gap is 8,126 rows, indicating strong clustering into a long sensor outage. 9 other variables share the same pattern of 366 missing rows and a longest run of 76, consistent with a shared sensor or recording outage rather than independent random omissions. Ground-truth pollutant channels also show substantial gaps: CO(GT): 1,683 (17.99%); NOx(GT): 1,639 (17.52%); NO2(GT): 1,642 (17.55%). Across all numeric variables, 16,701 cells are missing; 2,392 rows have multiple missing readings. The long blocks make a blanket missing-at-random assumption implausible, so the sparsest variable is excluded and only short, bounded gaps are interpolated.
+The missingness map is made from this exact pre-imputation snapshot. Black marks missing numeric readings, including converted -200 codes and values rejected by the stated domain checks.
+
+4. Preprocessing choices and measured effects
+Variables above 50% missing were excluded before imputation: NMHC(GT): 90.23.
+A three-IQR winsorisation threshold was used instead of deleting observations: the data are hourly, so dropping genuine pollution peaks would also break the time series. Measured values capped and bounds:
+  CO(GT): 27 capped at [-4.3, 8.3]
+  PT08.S1(CO): 0 capped at [55, 2113]
+  C6H6(GT): 23 capped at [-24.4, 42.8]
+  PT08.S2(NMHC): 0 capped at [-410, 2260]
+  NOx(GT): 75 capped at [-586, 1010]
+  PT08.S3(NOx): 29 capped at [-276.5, 1904]
+  NO2(GT): 1 capped at [-114, 334]
+  PT08.S4(NO2): 0 capped at [-114, 3015]
+  PT08.S5(O3): 0 capped at [-894.5, 2900]
+  T: 0 capped at [-26, 62.2]
+  RH: 0 capped at [-44.3, 142.6]
+  AH: 0 capped at [-0.9939, 3.044]
+Time interpolation filled only bounded gaps of at most 3 consecutive records; longer outages and edge gaps were not extrapolated.
+Values actually interpolated by column: CO(GT): 166; PT08.S1(CO): 6; C6H6(GT): 6; PT08.S2(NMHC): 6; NOx(GT): 325; PT08.S3(NOx): 6; NO2(GT): 326; PT08.S4(NO2): 6; PT08.S5(O3): 6; T: 6; RH: 6; AH: 6.
+Unresolved missing values by column before row removal: CO(GT): 1517; PT08.S1(CO): 360; C6H6(GT): 360; PT08.S2(NMHC): 360; NOx(GT): 1314; PT08.S3(NOx): 360; NO2(GT): 1316; PT08.S4(NO2): 360; PT08.S5(O3): 360; T: 360; RH: 360; AH: 360.
+Rows removed because at least one numeric value remained unresolved: 1,972.
+
+5. Final dataset
+Rows: 7,385; columns including missingness flags: 24.
+Missing values remaining in the cleaned output: 0.
+Output CSV: AirQualityUCI_clean.csv.
+Missingness map: missingness_map.png.
+Before/after plot: before_after.png.
