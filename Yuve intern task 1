@@ -13,501 +13,219 @@ Outputs:
 from __future__ import annotations
 
 import io
-import os
-import urllib.request
 import zipfile
-from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import requests
 
 URL = "https://archive.ics.uci.edu/static/public/360/air+quality.zip"
 RAW = "AirQualityUCI.csv"
 CLEAN = "AirQualityUCI_clean.csv"
-REPORT = "AirQuality_preprocessing_report.txt"
-MISSINGNESS_PLOT = "missingness_map.png"
-BEFORE_AFTER_PLOT = "before_after.png"
-MISSING_COLUMN_THRESHOLD = 50.0
-MAX_INTERPOLATION_GAP = 3
-
-DOMAIN_RULES = {
-    "CO(GT)": lambda values: values >= 0,
-    "C6H6(GT)": lambda values: values >= 0,
-    "NOx(GT)": lambda values: values >= 0,
-    "NO2(GT)": lambda values: values >= 0,
-    "RH": lambda values: values.between(0, 100),
-    "T": lambda values: values.between(-50, 60),
-}
 
 
+# ---------------------------------------------------------------
+# 1. DATA ACQUISITION
+# ---------------------------------------------------------------
 def download_dataset(url: str = URL, out: str = RAW) -> str:
-    """Download and extract the CSV from the UCI archive."""
-    with urllib.request.urlopen(url, timeout=60) as response:
-        archive = response.read()
-
-    with zipfile.ZipFile(io.BytesIO(archive)) as zip_file:
-        csv_files = [
-            name for name in zip_file.namelist()
-            if name.lower().endswith(".csv") and "__macosx" not in name.lower()
-        ]
-        if not csv_files:
-            raise FileNotFoundError("The UCI archive contains no CSV dataset.")
-        with zip_file.open(csv_files[0]) as source, open(out, "wb") as target:
-            target.write(source.read())
-
-    print(f"Downloaded {csv_files[0]} -> {out}")
+    """Download the zip from UCI and extract the CSV."""
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(response.content)) as zf:
+        csv_name = next(
+            n for n in zf.namelist()
+            if n.endswith(".csv") and "__MACOSX" not in n
+        )
+        with zf.open(csv_name) as src, open(out, "wb") as dst:
+            dst.write(src.read())
+    print(f"Saved {csv_name} -> {out}")
     return out
 
 
+# ---------------------------------------------------------------
+# 2. INITIAL EXPLORATION
+# ---------------------------------------------------------------
 def load_raw(path: str = RAW) -> pd.DataFrame:
-    """Read the European-formatted source and remove empty export columns."""
+    # The file uses ';' as separator and ',' as decimal mark (European format)
     df = pd.read_csv(path, sep=";", decimal=",")
-    df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
-    df = df.dropna(how="all").reset_index(drop=True)
-    required = {"Date", "Time"}
-    missing = required.difference(df.columns)
-    if missing:
-        raise ValueError(f"Dataset is missing required timestamp columns: {sorted(missing)}")
-    if df.empty:
-        raise ValueError(f"Dataset contains no records: {path}")
+    # Drop empty trailing columns ('Unnamed: 15', 'Unnamed: 16')
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+    # Drop rows that are entirely empty
+    df = df.dropna(how="all")
     return df
 
 
-def column_inventory(df: pd.DataFrame) -> pd.DataFrame:
-    """Return real/null/sentinel/unique counts for every source column."""
-    sentinel_counts = df.eq(-200).sum()
-    inventory = pd.DataFrame(index=df.columns)
-    inventory["dtype"] = df.dtypes.astype(str)
-    inventory["rows"] = len(df)
-    inventory["observed_including_sentinel"] = df.notna().sum()
-    inventory["blank_missing"] = df.isna().sum()
-    inventory["sentinel_-200"] = sentinel_counts
-    inventory["effective_missing"] = inventory["blank_missing"] + sentinel_counts
-    inventory["unique_including_sentinel"] = df.nunique(dropna=True)
-    inventory["effective_observed"] = len(df) - inventory["effective_missing"]
-    return inventory
+def explore(df: pd.DataFrame) -> None:
+    print("=" * 60)
+    print("SHAPE:", df.shape)
+    print("\nDATA TYPES:\n", df.dtypes)
+    print("\nFIRST ROWS:\n", df.head())
+    print("\nDESCRIPTIVE STATISTICS:\n", df.describe().T)
+    print("\nCOUNT OF SENTINEL VALUE -200 PER COLUMN:\n", (df == -200).sum())
+    print("\nDUPLICATE ROWS:", df.duplicated().sum())
 
 
-def explore(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Print an auditable column inventory, distributions, and duplicate count."""
-    inventory = column_inventory(df)
-    duplicate_rows = int(df.duplicated().sum())
-    print("=" * 72)
-    print(f"INITIAL DATASET: {len(df):,} rows x {len(df.columns)} columns")
-    print("\nPER-COLUMN EXPLORATION COUNTS:")
-    print(inventory.to_string())
-    print("\nNUMERIC DESCRIPTIVE STATISTICS:")
-    print(df.describe().T.to_string())
-    print(f"\nExact duplicate rows: {duplicate_rows:,}")
-    return inventory, duplicate_rows
-
-
-def parse_datetime(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Parse local timestamps, then remove invalid and duplicate timestamps."""
-    time_text = df["Time"].astype("string").str.replace(".", ":", regex=False)
-    parsed = pd.to_datetime(
-        df["Date"].astype("string") + " " + time_text,
+# ---------------------------------------------------------------
+# 3. TIMESTAMP PARSING AND DUPLICATES
+# ---------------------------------------------------------------
+def parse_datetime(df: pd.DataFrame) -> pd.DataFrame:
+    # Time is stored as "18.00.00"; convert the dots to colons
+    time_str = df["Time"].str.replace(".", ":", regex=False)
+    df["Datetime"] = pd.to_datetime(
+        df["Date"] + " " + time_str,
         format="%d/%m/%Y %H:%M:%S",
-        errors="coerce",
+        errors="coerce",          # bad timestamps become NaT instead of crashing
     )
-    invalid_count = int(parsed.isna().sum())
-    valid = df.loc[parsed.notna()].copy()
-    valid["Datetime"] = parsed.loc[parsed.notna()]
-    duplicate_count = int(valid["Datetime"].duplicated().sum())
-    valid = (
-        valid.drop_duplicates(subset="Datetime")
-        .drop(columns=["Date", "Time"])
-        .sort_values("Datetime")
-        .set_index("Datetime")
-    )
-    if valid.empty:
-        raise ValueError("No valid, unique timestamps remain after parsing.")
+    print("Unparseable timestamps:", df["Datetime"].isna().sum())
+    df = df.dropna(subset=["Datetime"]).drop(columns=["Date", "Time"])
 
-    details = {
-        "invalid_count": invalid_count,
-        "duplicate_count": duplicate_count,
-        "valid_unique_count": len(valid),
-        "start": valid.index.min(),
-        "end": valid.index.max(),
-    }
-    return valid, details
+    dupes = df["Datetime"].duplicated().sum()
+    print("Duplicate timestamps:", dupes)
+    df = (df.drop_duplicates(subset="Datetime")
+            .sort_values("Datetime")
+            .set_index("Datetime"))
+    return df
 
 
-def replace_sentinels(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Treat the dataset's -200 sensor failure code as missing, not a reading."""
-    counts = df.eq(-200).sum().astype(int).to_dict()
-    return df.replace(-200, np.nan), counts
+# ---------------------------------------------------------------
+# 4. MISSING VALUES
+# ---------------------------------------------------------------
+def handle_sentinels_and_missing(df: pd.DataFrame, drop_threshold: float = 50.0) -> pd.DataFrame:
+    # -200 is the dataset's documented code for "sensor failed / no reading"
+    df = df.replace(-200, np.nan)
+
+    missing_pct = df.isna().mean().mul(100).round(2).sort_values(ascending=False)
+    print("\nMISSING VALUES (%):\n", missing_pct)
+
+    # Columns with too much missing data carry little information
+    too_sparse = missing_pct[missing_pct > drop_threshold].index.tolist()
+    if too_sparse:
+        print(f"Dropping columns above {drop_threshold}% missing: {too_sparse}")
+        df = df.drop(columns=too_sparse)
+    return df
 
 
-def fix_invalid_entries(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Mark values that violate documented measurement bounds as missing."""
-    counts: dict[str, int] = {}
-    for column, valid_rule in DOMAIN_RULES.items():
-        if column not in df.columns:
+# ---------------------------------------------------------------
+# 5. ERRONEOUS ENTRIES (domain rules)
+# ---------------------------------------------------------------
+DOMAIN_RULES = {
+    "CO(GT)":   lambda s: s >= 0,
+    "C6H6(GT)": lambda s: s >= 0,
+    "NOx(GT)":  lambda s: s >= 0,
+    "NO2(GT)":  lambda s: s >= 0,
+    "RH":       lambda s: s.between(0, 100),    # relative humidity %
+    "T":        lambda s: s.between(-50, 60),   # temperature in Celsius
+}
+
+
+def fix_invalid_entries(df: pd.DataFrame) -> pd.DataFrame:
+    for col, rule in DOMAIN_RULES.items():
+        if col not in df.columns:
             continue
-        invalid = df[column].notna() & ~valid_rule(df[column])
-        counts[column] = int(invalid.sum())
-        df.loc[invalid, column] = np.nan
-    return df, counts
+        bad = df[col].notna() & ~rule(df[col])
+        print(f"Invalid entries in {col}: {bad.sum()}")
+        df.loc[bad, col] = np.nan     # mark as missing so it can be imputed
+    return df
 
 
-def longest_true_run(values: pd.Series) -> int:
-    """Count the longest contiguous run of True values."""
-    if values.empty or not values.any():
-        return 0
-    groups = values.ne(values.shift()).cumsum()
-    return int(values.groupby(groups).sum().max())
+# ---------------------------------------------------------------
+# 6. OUTLIERS (IQR method, winsorising)
+# ---------------------------------------------------------------
+def cap_outliers(df: pd.DataFrame, k: float = 3.0) -> pd.DataFrame:
+    """
+    Use k=3 (extreme outliers) instead of the usual 1.5 because
+    pollution spikes can be real events. Capping (winsorising) keeps
+    the row but limits its influence, which is safer than deleting it.
+    """
+    num_cols = df.select_dtypes("number").columns
+    summary = {}
+    for col in num_cols:
+        s = df[col].dropna()
+        q1, q3 = s.quantile([0.25, 0.75])
+        iqr = q3 - q1
+        lo, hi = q1 - k * iqr, q3 + k * iqr
+        n_out = ((df[col] < lo) | (df[col] > hi)).sum()
+        summary[col] = n_out
+        df[col] = df[col].clip(lower=lo, upper=hi)
+    print("\nOUTLIERS CAPPED PER COLUMN:\n", pd.Series(summary))
+    return df
 
 
-def missingness_details(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Summarise missing numeric readings and their temporal clustering."""
-    numeric = df.select_dtypes(include="number")
-    missing = numeric.isna()
-    per_column = pd.DataFrame({
-        "missing_count": missing.sum(),
-        "missing_pct": missing.mean().mul(100),
-        "longest_consecutive_gap": missing.apply(longest_true_run),
-    }).sort_values(["missing_pct", "missing_count"], ascending=False)
-    rows_with_missing = missing.any(axis=1)
-    overall = {
-        "record_count": len(numeric),
-        "missing_cells": int(missing.sum().sum()),
-        "rows_with_missing": int(rows_with_missing.sum()),
-        "rows_with_multiple_missing_columns": int(missing.sum(axis=1).gt(1).sum()),
-        "longest_affected_row_run": longest_true_run(rows_with_missing),
-    }
-    return per_column, overall
+# ---------------------------------------------------------------
+# 7. IMPUTATION (time-aware)
+# ---------------------------------------------------------------
+def impute(df: pd.DataFrame, max_gap_hours: int = 3) -> pd.DataFrame:
+    num_cols = df.select_dtypes("number").columns
 
+    # Keep a record of what was imputed. This is useful for later analysis.
+    flags = df[num_cols].isna().add_suffix("_was_missing").astype(int)
 
-def drop_sparse_columns(
-    df: pd.DataFrame, threshold: float = MISSING_COLUMN_THRESHOLD
-) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Drop numeric variables exceeding the documented missing-data threshold."""
-    numeric = df.select_dtypes(include="number")
-    missing_pct = numeric.isna().mean().mul(100)
-    removed = missing_pct[missing_pct > threshold].round(2).to_dict()
-    if removed:
-        df = df.drop(columns=list(removed))
-    return df, removed
-
-
-def cap_outliers(
-    df: pd.DataFrame, k: float = 3.0
-) -> tuple[pd.DataFrame, dict[str, dict[str, float | int]]]:
-    """Winsorise extreme numeric observations at three IQRs without deleting rows."""
-    summary: dict[str, dict[str, float | int]] = {}
-    for column in df.select_dtypes(include="number").columns:
-        values = df[column].dropna()
-        if values.empty:
-            summary[column] = {"count": 0, "lower": np.nan, "upper": np.nan}
-            continue
-        q1, q3 = values.quantile([0.25, 0.75])
-        spread = q3 - q1
-        lower = float(q1 - k * spread)
-        upper = float(q3 + k * spread)
-        capped = (df[column] < lower) | (df[column] > upper)
-        summary[column] = {
-            "count": int(capped.sum()),
-            "lower": lower,
-            "upper": upper,
-        }
-        df[column] = df[column].clip(lower=lower, upper=upper)
-    return df, summary
-
-
-def impute(
-    df: pd.DataFrame, max_gap: int = MAX_INTERPOLATION_GAP
-) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Interpolate only bounded missing runs of at most ``max_gap`` rows."""
-    columns = list(df.select_dtypes(include="number").columns)
-    missing_before = df[columns].isna()
-    flags = missing_before.astype("int8").add_suffix("_was_missing")
-    candidate_values = df[columns].interpolate(
-        method="time", limit_area="inside"
+    # Time-based interpolation. The limit prevents fabricating long gaps.
+    df[num_cols] = df[num_cols].interpolate(
+        method="time", limit=max_gap_hours, limit_direction="both"
     )
-    imputed_counts: dict[str, int] = {}
+    df = pd.concat([df, flags], axis=1)
 
-    for column in columns:
-        missing_positions = np.flatnonzero(missing_before[column].to_numpy())
-        eligible_positions: list[int] = []
-        if missing_positions.size:
-            runs = np.split(
-                missing_positions,
-                np.flatnonzero(np.diff(missing_positions) > 1) + 1,
-            )
-            for run in runs:
-                start = int(run[0])
-                end = int(run[-1])
-                bounded = start > 0 and end < len(df) - 1
-                short_enough = len(run) <= max_gap
-                if bounded and short_enough:
-                    eligible_positions.extend(run.tolist())
-        if eligible_positions:
-            df.iloc[eligible_positions, df.columns.get_loc(column)] = (
-                candidate_values.iloc[eligible_positions][column].to_numpy()
-            )
-        imputed_counts[column] = len(eligible_positions)
-
-    unresolved = df[columns].isna().sum().astype(int).to_dict()
-    rows_before_drop = len(df)
-    incomplete_rows = df[columns].isna().any(axis=1)
-    dropped_rows = int(incomplete_rows.sum())
-    df = pd.concat([df, flags], axis=1).loc[~incomplete_rows]
-    return df, {
-        "max_gap": max_gap,
-        "imputed_counts": imputed_counts,
-        "unresolved_by_column": unresolved,
-        "rows_dropped": rows_before_drop - len(df),
-    }
+    remaining = df[num_cols].isna().any(axis=1).sum()
+    print(f"\nRows still incomplete after limited interpolation: {remaining}")
+    df = df.dropna(subset=num_cols)
+    return df
 
 
-def format_counts(counts: dict[str, Any]) -> str:
-    if not counts:
-        return "none"
-    return "; ".join(f"{key}: {value}" for key, value in counts.items())
+# ---------------------------------------------------------------
+# 8. VISUALISATIONS (screenshots for the report)
+# ---------------------------------------------------------------
+def plot_missingness(df: pd.DataFrame, path: str = "missingness_map.png") -> None:
+    plt.figure(figsize=(10, 4))
+    plt.imshow(df.isna().T, aspect="auto", cmap="Greys", interpolation="nearest")
+    plt.yticks(range(df.shape[1]), df.columns)
+    plt.xlabel("Row index (time order)")
+    plt.title("Missing values (black = missing)")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
 
 
-def describe_missingness(
-    per_column: pd.DataFrame, overall: dict[str, int]
-) -> str:
-    """Generate an interpretation grounded in the observed missingness totals."""
-    if per_column.empty or overall["missing_cells"] == 0:
-        return "No missing numeric readings were present before imputation."
-
-    highest_column = str(per_column.index[0])
-    highest = per_column.iloc[0]
-    longest = int(highest["longest_consecutive_gap"])
-    missing_count = int(highest["missing_count"])
-    if longest == 0:
-        pattern = "no consecutive gap"
-    elif longest == 1:
-        pattern = "only isolated missing readings"
-    elif longest >= max(5, int(missing_count * 0.25)):
-        pattern = "strong clustering into a long sensor outage"
-    else:
-        pattern = "a mixture of short runs and isolated gaps"
-
-    sentences = [
-        f"{highest_column} is the most affected variable: {missing_count:,} of "
-        f"{overall['record_count']:,} records are missing "
-        f"({highest['missing_pct']:.2f}%). Its longest consecutive gap is "
-        f"{longest:,} rows, indicating {pattern}."
-    ]
-
-    peer_columns = per_column.drop(index=highest_column)
-    if not peer_columns.empty:
-        peer_patterns = peer_columns.groupby(
-            ["missing_count", "longest_consecutive_gap"], sort=False
-        ).size()
-        common_pattern = peer_patterns.idxmax()
-        common_count = int(peer_patterns.max())
-        if common_count > 1:
-            sentences.append(
-                f"{common_count} other variables share the same pattern of "
-                f"{int(common_pattern[0]):,} missing rows and a longest run of "
-                f"{int(common_pattern[1]):,}, consistent with a shared sensor "
-                "or recording outage rather than independent random omissions."
-            )
-
-    reference_columns = [
-        column for column in ("CO(GT)", "NOx(GT)", "NO2(GT)")
-        if column in per_column.index
-    ]
-    if reference_columns:
-        reference_summary = "; ".join(
-            f"{column}: {int(per_column.loc[column, 'missing_count']):,} "
-            f"({per_column.loc[column, 'missing_pct']:.2f}%)"
-            for column in reference_columns
-        )
-        sentences.append(
-            "Ground-truth pollutant channels also show substantial gaps: "
-            f"{reference_summary}."
-        )
-
-    sentences.append(
-        f"Across all numeric variables, {overall['missing_cells']:,} cells are "
-        f"missing; {overall['rows_with_multiple_missing_columns']:,} rows have "
-        "multiple missing readings. The long blocks make a blanket missing-at-random "
-        "assumption implausible, so the sparsest variable is excluded and only short, "
-        "bounded gaps are interpolated."
-    )
-    return " ".join(sentences)
+def plot_before_after(raw: pd.DataFrame, clean: pd.DataFrame,
+                      col: str = "CO(GT)", path: str = "before_after.png") -> None:
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    ax[0].boxplot(raw[col].dropna())
+    ax[0].set_title(f"{col} - raw (includes -200 codes)")
+    ax[1].boxplot(clean[col].dropna())
+    ax[1].set_title(f"{col} - cleaned")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
 
 
-def outlier_report(summary: dict[str, dict[str, float | int]]) -> str:
-    return "\n".join(
-        f"  {column}: {details['count']} capped at "
-        f"[{details['lower']:.4g}, {details['upper']:.4g}]"
-        for column, details in summary.items()
-    ) or "  No numeric columns were available."
-
-
-def build_report(
-    raw: pd.DataFrame,
-    inventory: pd.DataFrame,
-    duplicate_rows: int,
-    timestamps: dict[str, Any],
-    sentinel_counts: dict[str, int],
-    invalid_counts: dict[str, int],
-    missing_by_column: pd.DataFrame,
-    missing_overall: dict[str, int],
-    removed_columns: dict[str, float],
-    outliers: dict[str, dict[str, float | int]],
-    imputation: dict[str, Any],
-    clean: pd.DataFrame,
-) -> str:
-    """Build the evidence-based text report from this run's measured results."""
-    report_lines = [
-        "UCI AIR QUALITY — PREPROCESSING AND EXPLORATION REPORT",
-        "=" * 58,
-        "",
-        "1. Dataset and source inventory",
-        f"Loaded {len(raw):,} records and {len(raw.columns)} source columns.",
-        f"Exact duplicate rows before timestamp cleanup: {duplicate_rows:,}.",
-        "Column counts below separate literal blanks from the dataset's -200 "
-        "sensor-failure code; effective missing = blanks + -200:",
-        inventory.to_string(),
-        "",
-        "2. Timestamp checks",
-        f"Unparseable timestamps removed: {timestamps['invalid_count']:,}.",
-        f"Duplicate timestamps removed: {timestamps['duplicate_count']:,}.",
-        f"Valid unique timestamped rows retained: {timestamps['valid_unique_count']:,}.",
-        f"Observation window: {timestamps['start']} through {timestamps['end']}.",
-        "",
-        "3. Missingness before interpolation",
-        "Sensor-failure codes converted to NaN by source column: "
-        f"{format_counts(sentinel_counts)}.",
-        "Out-of-domain values converted to NaN by column: "
-        f"{format_counts(invalid_counts)}.",
-        f"Missing numeric cells: {missing_overall['missing_cells']:,}.",
-        f"Rows with at least one missing numeric reading: "
-        f"{missing_overall['rows_with_missing']:,}.",
-        f"Rows missing more than one numeric variable: "
-        f"{missing_overall['rows_with_multiple_missing_columns']:,}.",
-        f"Longest continuous row run with any missing reading: "
-        f"{missing_overall['longest_affected_row_run']:,}.",
-        "Per-column missing counts, percentages, and longest consecutive gaps:",
-        missing_by_column.round({"missing_pct": 2}).to_string(),
-        describe_missingness(missing_by_column, missing_overall),
-        "The missingness map is made from this exact pre-imputation snapshot. "
-        "Black marks missing numeric readings, including converted -200 codes "
-        "and values rejected by the stated domain checks.",
-        "",
-        "4. Preprocessing choices and measured effects",
-        f"Variables above {MISSING_COLUMN_THRESHOLD:.0f}% missing were excluded "
-        "before imputation: "
-        f"{format_counts(removed_columns) if removed_columns else 'none'}.",
-        "A three-IQR winsorisation threshold was used instead of deleting "
-        "observations: the data are hourly, so dropping genuine pollution peaks "
-        "would also break the time series. Measured values capped and bounds:",
-        outlier_report(outliers),
-        f"Time interpolation filled only bounded gaps of at most "
-        f"{imputation['max_gap']} consecutive records; longer outages and edge "
-        "gaps were not extrapolated.",
-        "Values actually interpolated by column: "
-        f"{format_counts(imputation['imputed_counts'])}.",
-        "Unresolved missing values by column before row removal: "
-        f"{format_counts(imputation['unresolved_by_column'])}.",
-        f"Rows removed because at least one numeric value remained unresolved: "
-        f"{imputation['rows_dropped']:,}.",
-        "",
-        "5. Final dataset",
-        f"Rows: {len(clean):,}; columns including missingness flags: {len(clean.columns)}.",
-        f"Missing values remaining in the cleaned output: "
-        f"{int(clean.isna().sum().sum()):,}.",
-        f"Output CSV: {CLEAN}.",
-        f"Missingness map: {MISSINGNESS_PLOT}.",
-        f"Before/after plot: {BEFORE_AFTER_PLOT}.",
-    ]
-    return "\n".join(report_lines) + "\n"
-
-
-def plot_missingness(df: pd.DataFrame, path: str = MISSINGNESS_PLOT) -> None:
-    """Plot missing numeric cells before imputation, preserving time order."""
-    missing = df.select_dtypes(include="number").isna().to_numpy().T
-    if missing.shape[0] == 0:
-        raise ValueError("Cannot create a missingness map: no numeric columns.")
-    fig, axis = plt.subplots(figsize=(12, max(4, 0.35 * missing.shape[0])))
-    axis.imshow(missing, aspect="auto", cmap="binary", interpolation="nearest")
-    axis.set_yticks(range(missing.shape[0]))
-    axis.set_yticklabels(df.select_dtypes(include="number").columns)
-    axis.set_xlabel("Observation index (sorted by timestamp)")
-    axis.set_title("Missing numeric readings before imputation (black = missing)")
-    fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-
-
-def plot_before_after(
-    before: pd.DataFrame,
-    after: pd.DataFrame,
-    column: str = "CO(GT)",
-    path: str = BEFORE_AFTER_PLOT,
-) -> None:
-    """Compare measured values before and after outlier handling and imputation."""
-    if column not in before or column not in after:
-        print(f"Skipping before/after plot: {column} is unavailable.")
-        return
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    axes[0].boxplot(before[column].dropna())
-    axes[0].set_title(f"{column} before capping/imputation")
-    axes[1].boxplot(after[column].dropna())
-    axes[1].set_title(f"{column} after preprocessing")
-    for axis in axes:
-        axis.set_ylabel("Measured concentration")
-    fig.tight_layout()
-    fig.savefig(path, dpi=160)
-    plt.close(fig)
-
-
-def main() -> None:
-    if not os.path.exists(RAW):
+# ---------------------------------------------------------------
+# PIPELINE
+# ---------------------------------------------------------------
+def main():
+    if not pd.io.common.file_exists(RAW) if hasattr(pd.io.common, "file_exists") else not __import__("os").path.exists(RAW):
         download_dataset()
 
     raw = load_raw()
-    inventory, duplicate_rows = explore(raw)
-    df, timestamp_details = parse_datetime(raw.copy())
-    df, sentinel_counts = replace_sentinels(df)
-    df, invalid_counts = fix_invalid_entries(df)
+    explore(raw)
 
-    # Keep one pre-imputation snapshot for both the missingness map and plot.
-    missingness_snapshot = df.copy()
-    before_after_snapshot = df.copy()
-    missing_by_column, missing_overall = missingness_details(missingness_snapshot)
-    print("\nMISSINGNESS BEFORE IMPUTATION:")
-    print(missing_by_column.round({"missing_pct": 2}).to_string())
-    print("\n" + describe_missingness(missing_by_column, missing_overall))
-    plot_missingness(missingness_snapshot)
+    df = parse_datetime(raw.copy())
+    raw_for_plot = df.copy()                 # snapshot before cleaning
 
-    df, removed_columns = drop_sparse_columns(df)
-    df, outlier_details = cap_outliers(df)
-    df, imputation_details = impute(df)
+    df = handle_sentinels_and_missing(df)
+    df = fix_invalid_entries(df)
+    df = cap_outliers(df)
+    df = impute(df)
 
-    report = build_report(
-        raw=raw,
-        inventory=inventory,
-        duplicate_rows=duplicate_rows,
-        timestamps=timestamp_details,
-        sentinel_counts=sentinel_counts,
-        invalid_counts=invalid_counts,
-        missing_by_column=missing_by_column,
-        missing_overall=missing_overall,
-        removed_columns=removed_columns,
-        outliers=outlier_details,
-        imputation=imputation_details,
-        clean=df,
-    )
-    with open(REPORT, "w", encoding="utf-8") as output:
-        output.write(report)
+    print("\nFINAL SHAPE:", df.shape)
+    print("Remaining missing values:", df.isna().sum().sum())
 
     df.to_csv(CLEAN)
-    plot_before_after(before_after_snapshot, df)
-    print(f"\nFinal dataset: {len(df):,} rows x {len(df.columns)} columns")
-    print(f"Remaining missing values: {int(df.isna().sum().sum()):,}")
-    print(f"Cleaned data saved to {CLEAN}")
-    print(f"Detailed report saved to {REPORT}")
-    print(f"Figures saved to {MISSINGNESS_PLOT} and {BEFORE_AFTER_PLOT}")
+    print(f"Cleaned dataset saved to {CLEAN}")
+
+    plot_missingness(raw_for_plot)
+    plot_before_after(raw_for_plot, df)
+    print("Figures saved: missingness_map.png, before_after.png")
 
 
 if __name__ == "__main__":
